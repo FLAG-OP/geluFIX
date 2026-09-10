@@ -7,7 +7,7 @@
 Part A 必须在未 enable 的干净进程跑: 实测发现 flag_gems.enable() 之后的
 Triton 编译上下文 (libentry/autotune 包装) 会让裸 libdevice 调用走不同
 pass 路径, 同一 kernel enable 前 OK / enable 后 MLIRCompilationError
-(与 int 指数无关的独立现象, 见报告 §8.6)。
+(与 int 指数无关的独立现象, 见报告 §8.5)。
 """
 import subprocess
 import sys

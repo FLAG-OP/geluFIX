@@ -9,12 +9,19 @@ KeyError: (triton.language.float32, triton.language.int32)
 ```
 
 一句话版本：**CANN 的 libdevice `pow` 查表只认 float/float 组合，而 kernel 里
-`pow(x, 2)` 的字面量 `2` 被 Triton 定型为 int32——查不到就 KeyError。把指数写成
-`2.0`，问题消失。gelu 前向/反向/原地版 + geglu + gelu_and_mul 共 8 处同病，一起修。**
+`pow(x, 2)` 的字面量 `2` 被 Triton 定型为 int32——查不到就 KeyError。**
+我们提供两层修复，可单用可叠加：
+
+1. **gelu.patch（热修层）**：调用方指数 `2` → `2.0`，gelu 前向/反向/原地版 +
+   geglu + gelu_and_mul 共 8 处同病一起修；
+2. **libdevice_pow_promotion.patch（泛用层）**：直接改 `pow` 分发器本体，
+   int 指数自动提升为 float——一处修复让**全仓库所有 `pow(x, N)` 写法免疫**，
+   包括我们没逐个修的 weightnorm `pow(,3)` 等（实测对比见"两种修复层级"一节）。
 
 ```
 修复前: gelu(tanh) 全 dtype 编译期 KeyError (CANN 8.5 / 9.0 均复现)
 修复后: fp32/fp16/bf16 前向+反向与 CPU 原生 allclose, max|diff| ≤ 7.6e-6
+泛用层: 原版 flag_gems (int 指数原样) + 仅打 libdevice 补丁 → 同样全过
 ```
 
 ## 问题是怎么回事
@@ -150,7 +157,7 @@ fp16 差异点 100% ≤1 ULP（纯舍入边界翻转），fp32 绝对差全在 1
 │   ├── gelu_red.py        # TDD 红转绿: gelu 家族 7 项
 │   ├── fused_red.py       # TDD 红转绿: geglu/gelu_and_mul 3 项
 │   ├── test_upstream_layer.py   # 上游层泛用性 10 项 (Part A 子进程 + Part B 叠加态)
-│   ├── int_pow_standalone.py    # int-pow kernel 独立脚本 (不 enable, 规避 §8.6 现象)
+│   ├── int_pow_standalone.py    # int-pow kernel 独立脚本 (不 enable, 规避 §8.5 现象)
 │   ├── accuracy.py        # 精度矩阵 (3 dtype × 2 模式 + backward)
 │   ├── pow_dtype_probe.py # 根因三对照 (int/float/显式 fp32 指数)
 │   ├── ulp_fix2.py        # ULP 归一化精度分析
@@ -178,15 +185,33 @@ triton-ascend 仓库），但 flag_gems 侧传 float 指数是更小、跨后端
 
 ## 两种修复层级（可独立使用，也可叠加）
 
-**gelu.patch（flag_gems 层，默认推荐）**：8 处 `pow(x, 2)` → `pow(x, 2.0)`。
+**gelu.patch（flag_gems 层，热修）**：8 处 `pow(x, 2)` → `pow(x, 2.0)`。
 最小、跨后端安全，但只修已知调用点。
 
-**libdevice_pow_promotion.patch（triton-ascend 层，泛化方案）**：直接给
+**libdevice_pow_promotion.patch（triton-ascend 层，泛用）**：直接给
 `triton/language/extra/cann/libdevice.py` 的 `pow` 加 int 指数自动提升
-（constexpr[int]/裸 int → float）。一处修复让**所有** `pow(x, N)` 写法免疫
-——包括 weightnorm 的 `pow(norm, 3)` 等 4 处我们没在 gelu.patch 里修的同模式
-（原版 flag_gems + 仅打此补丁，全部实测通过，见报告 §8.3）。代价：改动在
-triton 环境的 site-packages，换环境要重打；上游合入后此补丁可废弃。
+（constexpr[int]/裸 int → float）。一处修复让**所有** `pow(x, N)` 写法免疫。
+
+### 泛用性实测结果（原版 flag_gems + 仅打 libdevice 补丁，不动任何调用方）
+
+| 验证项（int 指数原样保留） | 无补丁 | 仅 libdevice 补丁 |
+|---|---|---|
+| `pow(x, 2)` 最小 kernel（干净进程） | CompilationError | **OK，数值 allclose** |
+| gelu tanh fp32 / fp16 / bf16 前向 | 全崩 | **全 OK，与原生 allclose** |
+| gelu tanh backward + `gelu_` 原地 | 崩 | **OK** |
+| fused gelu_and_mul(tanh) / geglu | 崩 | **OK** |
+| **weightnorm `pow(norm, 3)`**（gelu.patch 不覆盖的 4 处） | 崩 | **OK** |
+| 仓库 pytest gelu 家族（--ref cpu） | 大面积编译失败 | **144 passed** |
+
+要点：泛用层救活的不止 issue 报的 gelu——**weightnorm 这类我们没在热修层
+逐个改的同模式调用点一并覆盖**，且未来新写的 `pow(x, N)` 同样免疫。
+数值侧三重 A/B（同输入原版 vs 补丁、gems vs CPU `aten._weight_norm`）
+输出逐位一致，确认补丁只修类型路由、不改数值（报告 §8.4）。
+
+代价与边界：改动在 triton 环境的 site-packages，换环境要重打（用
+`tools/apply_upstream_patch.py` 一条命令）；简单版把 int 提升为 fp32，
+fp16 底数 + int 指数组合仍会查表失败（gelu 家族全走 fp32 中间量，不受
+影响）；上游 triton-ascend 合入后此补丁可废弃。
 
 ```bash
 # 上游层补丁用法 (或用等价的幂等工具)
@@ -196,6 +221,10 @@ python tools/apply_upstream_patch.py revert   # 恢复原版
 # 或手动:
 cd /path/to/triton && patch -p1 < libdevice_pow_promotion.patch
 ```
+
+**推荐**：两层叠加部署（本机验证即叠加态，全绿）——热修层保底跨后端，
+泛用层兜住未改调用点。上游 PR 建议走 libdevice 层（治本），gelu.patch
+作为立即可用的热修并行提交。
 
 ## 已知边界（不装完美）
 
@@ -215,6 +244,9 @@ cd /path/to/triton && patch -p1 < libdevice_pow_promotion.patch
 | 根因三对照（int/float/显式指数） | int 崩、float OK 且数值正确——因果坐实 |
 | TDD 红→绿（gelu 家族 7 项 + fused 3 项） | 红 5+2 FAIL → **绿 10/10** |
 | 精度矩阵（3 dtype × none/tanh + backward） | 与 CPU 原生 allclose 全过，max diff ≤7.6e-6 |
+| 泛用层（原版 flag_gems + 仅 libdevice 补丁） | gelu/fused/weightnorm 全过，pytest 144 passed（见"两种修复层级"表） |
+| 泛用层数值无害性（三重 A/B） | 同输入输出逐位一致，只修类型路由 |
+| 叠加态全量（热修 + 泛用同开） | 6 脚本全绿 + test_upstream_layer 10/10 |
 | 仓库 pytest（--ref cpu） | **144 passed / 0 failed** |
 | 仓库 pytest（默认 NPU fp64 参考） | 39 none 失败（存量，修复前后一致，已排除回归） |
 | ULP 分析 | fp16 差异 100% ≤1 ULP；fp32 绝对差 ~1e-7 |
