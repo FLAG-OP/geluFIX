@@ -138,6 +138,7 @@ fp16 差异点 100% ≤1 ULP（纯舍入边界翻转），fp32 绝对差全在 1
 ```
 ├── README.md              # 本文
 ├── gelu.patch             # 三文件最小 diff（含署名），git apply 用
+├── libdevice_pow_promotion.patch  # 上游层修复: cann libdevice pow int 指数提升(泛化方案, 见报告§8)
 ├── src/
 │   ├── gelu.py(.orig)     # ops/gelu.py 修复版 + v5.3.5 原版
 │   ├── geglu.py(.orig)    # fused/geglu.py 同上
@@ -169,11 +170,29 @@ fp16 差异点 100% ≤1 ULP（纯舍入边界翻转），fp32 绝对差全在 1
 真正的错误源头在 `triton/language/extra/cann/libdevice.py` 的 `pow` 表（上游
 triton-ascend 仓库），但 flag_gems 侧传 float 指数是更小、跨后端安全的修法。
 
+## 两种修复层级（可独立使用，也可叠加）
+
+**gelu.patch（flag_gems 层，默认推荐）**：8 处 `pow(x, 2)` → `pow(x, 2.0)`。
+最小、跨后端安全，但只修已知调用点。
+
+**libdevice_pow_promotion.patch（triton-ascend 层，泛化方案）**：直接给
+`triton/language/extra/cann/libdevice.py` 的 `pow` 加 int 指数自动提升
+（constexpr[int]/裸 int → float）。一处修复让**所有** `pow(x, N)` 写法免疫
+——包括 weightnorm 的 `pow(norm, 3)` 等 4 处我们没在 gelu.patch 里修的同模式
+（原版 flag_gems + 仅打此补丁，全部实测通过，见报告 §8.3）。代价：改动在
+triton 环境的 site-packages，换环境要重打；上游合入后此补丁可废弃。
+
+```bash
+# 上游层补丁用法
+cd /path/to/triton && patch -p1 < libdevice_pow_promotion.patch
+find .../__pycache__ -name 'libdevice*' -exec rm -f {} +
+```
+
 ## 已知边界（不装完美）
 
-- **weightnorm 的 `pow(norm, 3)` 未修**（ops + fused 共 4 处同模式）：实测路径
-  未确认是否可达（weightnorm 走 tl_extra_shim.pow 的调用链需单独验证），
-  超出本 issue 范围，建议上游顺带修
+- **weightnorm 的 `pow(norm, 3)` 在 gelu.patch 里未修**（4 处同模式）：gelu.patch
+  层面超出本 issue 范围；但 **libdevice_pow_promotion.patch 已覆盖它**
+  （原版 weightnorm + 上游补丁实测通过）——要泛化保护就用上游层补丁
 - **CANN 9.0 未实测**：issue 报障环境是 CANN 9.0，本机 8.5 复现并修复；
   KeyError 机制（查表）与 CANN 版本无关，判断同修，但无 9.0 实机
 - **NPU fp64 参考值问题只诊断未修**：属于测试基础设施问题，影响面超出 gelu

@@ -1,0 +1,17 @@
+127a128,143
+>     # wt-2026-09-10-fix (FlagGems #5867): a Python int literal exponent
+>     # (pow(x, 2)) reaches here as constexpr[2] via the JIT call path and
+>     # extern_elementwise's to_tensor types it int32, but the dispatch tables
+>     # only contain float/float pairs -> KeyError(float32, int32) at compile
+>     # time (the whole gelu-tanh family died on this). Promote integral
+>     # constexpr/bare-int exponents to float so the lookup lands on (fp,fp).
+>     # wt <wangt635@ustc.edu.cn>
+>     if type(arg1) is int:
+>         arg1 = float(arg1)
+>     elif type(arg1).__name__ == "constexpr":
+>         try:
+>             v = arg1.value
+>             if type(v) is int and getattr(arg0, "dtype", None) is not None:
+>                 arg1 = float(v)
+>         except AttributeError:
+>             pass

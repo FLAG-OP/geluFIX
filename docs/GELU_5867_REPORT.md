@@ -174,3 +174,79 @@ ASCEND_LAUNCH_BLOCKING=1 python -m pytest tests/test_gelu.py \
 3. triton-ascend 侧考虑 cann libdevice pow 的 int 指数隐式提升或更完整的
    dtype 表 + 错误信息（报出支持的组合，而不是裸 KeyError）。
 4. 测试基础设施：fp64 参考固定 CPU（§5），避免 Ascend 全量测试假失败。
+
+---
+
+## 8. 追加实验：上游层（triton-ascend libdevice）修复的可行性验证（2026-09-10）
+
+**问题**：能不能不逐个改调用方，直接在 pow 的分发层修，让所有 `pow(x, N)` 写法
+天然免疫？——可以，已在本机验证。
+
+### 8.1 调用机制考古（为什么 host 侧 monkey-patch 全部失败）
+
+JIT 编译器（`spec/ascend/compiler/code_generator.py` `call_Function`）对
+builtin_namespace 里的 libdevice 函数：先 `_unwrap_if_constexpr(args)` 再
+`fn(*args, **kws)` **不注入 `_semantic`**。实测（spy hook）kernel 里写的
+`pow(x, 2)` 到达函数体时：`arg1 = constexpr[2]`，`_semantic = None`。
+
+因此 v1–v4 的四轮尝试（host 侧属性替换 / semantic.to_tensor 提升 /
+arg1.to() 提升 / 裸 int 判定）全部无效——要么拿不到 semantic，要么 arg1
+根本不是裸 int。
+
+### 8.2 有效修复（v5，`libdevice_pow_promotion.patch`）
+
+在 `triton/language/extra/cann/libdevice.py` 的 `pow` 函数体开头加：
+
+```python
+if type(arg1) is int:
+    arg1 = float(arg1)
+elif type(arg1).__name__ == "constexpr":
+    v = arg1.value          # constexpr 的 .value 存裸 Python 值
+    if type(v) is int:
+        arg1 = float(v)
+```
+
+`extern_elementwise` 内部的 `to_tensor` 会把 float 定型为 fp32，查表落到
+`(fp32, fp32)`。**注意**：fp16 底数 + int 指数场景会提升成 `(fp16, fp32)`
+组合——表里同样没有，仍会 KeyError；完整修复应按 arg0.dtype 构造标量。
+gelu 家族全部是 fp32 中间量（`x_fp32`），实测不受此限。
+
+### 8.3 泛用性验证（原版 flag_gems + 仅打 libdevice 补丁）
+
+把 flag_gems 三个文件恢复 v5.3.5 原版（int 指数），只留 libdevice 补丁：
+
+| 验证 | 结果 |
+|---|---|
+| `pow(x, 2)` int 指数最小 kernel | OK，数值 allclose |
+| gelu tanh fp32/fp16/bf16（原版 int 指数） | 全 OK，与原生 allclose |
+| fused gelu_and_mul / geglu（原版） | OK |
+| **weight_norm 的 `pow(norm, 3)`（原版，从未单独修过）** | **OK**——上游层一处修复覆盖了它 |
+| gelu_ / backward | OK |
+| 仓库 pytest gelu 家族 `--ref cpu` | 144 passed |
+
+**结论**：上游层修复一处，覆盖所有 int 指数调用点（含 weightnorm 这类我们
+没在 geluFIX 里修的），泛用性确实更强——用户的直觉正确。
+
+### 8.4 weight_norm pytest 失败的裁定（与补丁无关）
+
+补丁态下 test_weight_norm 偶现 1-2 个 bf16/fp16 用例失败，一度疑似补丁
+引入。三轮排查裁定为**存量浮点非确定性**：
+
+1. 同输入 A/B（原版 vs 补丁，同种子）：输出**逐位一致**（三组实验）
+2. gems 输出 vs CPU `aten._weight_norm` 同输入：**逐位一致**
+   （初版 A/B 的"参考"是笔者手写公式算错——`_weight_norm` 语义是
+   `v/||v||*g`，已在报告中修正记录）
+3. 原版 libdevice 连跑 pytest 3 次：**同样 1-2 个失败**，且失败用例 ID
+   每次不同（dtype0-0 / dtype2--1 / dtype2-0 轮换）——NPU 归约的并行
+   顺序非确定，输出在 bf16 1 ULP 边界抖动，atol=1e-4 挡不住
+
+### 8.5 推荐部署
+
+两层修复**可独立也可叠加**（本机当前为叠加态，全绿）：
+
+- **最小改动**（只动 flag_gems）：用 gelu.patch——跨后端安全，但只修 8 处调用点
+- **泛化根治**（动 triton 包）：用 libdevice_pow_promotion.patch——覆盖全部
+  现有及未来的 int 指数调用（含 weightnorm），但属 triton-ascend 环境的
+  site-packages 改动，换环境需重打；上游合入后此补丁可废弃
+- 建议上游 PR 走 libdevice 层（泛用），flag_gems 层 8 处 `2.0` 改动作为
+  立即可用的热修并行提交
