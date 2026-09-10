@@ -240,6 +240,23 @@ gelu 家族全部是 fp32 中间量（`x_fp32`），实测不受此限。
    每次不同（dtype0-0 / dtype2--1 / dtype2-0 轮换）——NPU 归约的并行
    顺序非确定，输出在 bf16 1 ULP 边界抖动，atol=1e-4 挡不住
 
+### 8.6 enable() 对裸 libdevice kernel 的编译影响（独立现象，未定论）
+
+泛用性验证过程中发现：同一个最小 int-pow kernel（直接调
+`cann.libdevice.pow(x, 2)`），**enable 前编译 OK，`flag_gems.enable()` 之后
+编译报 `MLIRCompilationError`（ConvertLinalgIR pass）**。多次复现，稳定。
+
+排查确认：
+- 与 int 指数无关——float 指数版在 enable 后同样路径未见测试失败（gelu 全绿）
+- 与本补丁无关——原版 libdevice 下同样复现（KeyError 与 MLIR 错误是两个
+  不同阶段的失败，前者根本没到 MLIR）
+- `pow_dtype_probe.py` 之所以一直 OK：它不 enable，独立进程
+
+推测是 flag_gems 的 libentry/autotune 全局包装改变了裸 Triton kernel 的
+编译上下文（pass pipeline 配置），但未深挖——超出本 issue 范围，如实记录。
+**实践建议**：验证 libdevice 层行为时用不 enable 的独立进程
+（`tests/int_pow_standalone.py` 即为此设计）。
+
 ### 8.5 推荐部署
 
 两层修复**可独立也可叠加**（本机当前为叠加态，全绿）：

@@ -97,6 +97,8 @@ find /path/to/site-packages/flag_gems -name __pycache__ -exec rm -rf {} +
 ASCEND_LAUNCH_BLOCKING=1 python tests/repro_5867.py        # issue 原复现，全 OK
 ASCEND_LAUNCH_BLOCKING=1 python tests/gelu_red.py          # 7 项: TOTAL: 7, failed: 0
 ASCEND_LAUNCH_BLOCKING=1 python tests/fused_red.py        # 3 项: TOTAL: 3, failed: 0
+ASCEND_LAUNCH_BLOCKING=1 python tests/test_upstream_layer.py  # 上游层: 10 项 (含 weightnorm)
+ASCEND_LAUNCH_BLOCKING=1 python tests/int_pow_standalone.py   # int-pow kernel 单独跑 (不 enable)
 ASCEND_LAUNCH_BLOCKING=1 python tests/accuracy.py         # 精度矩阵全 allclose
 ASCEND_LAUNCH_BLOCKING=1 python tests/pow_dtype_probe.py  # 根因三对照
 ```
@@ -147,13 +149,17 @@ fp16 差异点 100% ≤1 ULP（纯舍入边界翻转），fp32 绝对差全在 1
 │   ├── repro_5867.py      # issue 复现 + 修复验收
 │   ├── gelu_red.py        # TDD 红转绿: gelu 家族 7 项
 │   ├── fused_red.py       # TDD 红转绿: geglu/gelu_and_mul 3 项
+│   ├── test_upstream_layer.py   # 上游层泛用性 10 项 (Part A 子进程 + Part B 叠加态)
+│   ├── int_pow_standalone.py    # int-pow kernel 独立脚本 (不 enable, 规避 §8.6 现象)
 │   ├── accuracy.py        # 精度矩阵 (3 dtype × 2 模式 + backward)
 │   ├── pow_dtype_probe.py # 根因三对照 (int/float/显式 fp32 指数)
 │   ├── ulp_fix2.py        # ULP 归一化精度分析
 │   ├── tolerance_probe2.py# 容差公式三套判定 (CPU fp64 参考)
 │   └── test_gelu_repo.py  # 仓库版 pytest (需放回仓库 tests/ 跑)
+├── tools/
+│   └── apply_upstream_patch.py  # 上游补丁幂等安装/卸载/状态 (apply|revert|status)
 └── docs/
-    └── GELU_5867_REPORT.md # 完整报告: 根因、影响面、精度与容差分析
+    └── GELU_5867_REPORT.md # 完整报告: 根因、影响面、精度与容差分析、上游层验证(§8)
 ```
 
 ## 如果你想深究 bug 在哪一行
@@ -183,9 +189,12 @@ triton-ascend 仓库），但 flag_gems 侧传 float 指数是更小、跨后端
 triton 环境的 site-packages，换环境要重打；上游合入后此补丁可废弃。
 
 ```bash
-# 上游层补丁用法
+# 上游层补丁用法 (或用等价的幂等工具)
+python tools/apply_upstream_patch.py apply    # 自动探测 triton 路径, 备份 .orig
+python tools/apply_upstream_patch.py status   # 查看状态
+python tools/apply_upstream_patch.py revert   # 恢复原版
+# 或手动:
 cd /path/to/triton && patch -p1 < libdevice_pow_promotion.patch
-find .../__pycache__ -name 'libdevice*' -exec rm -f {} +
 ```
 
 ## 已知边界（不装完美）
