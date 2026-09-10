@@ -1,0 +1,133 @@
+diff --git a/src/flag_gems/fused/geglu.py b/src/flag_gems/fused/geglu.py
+index f387e66..bb1e7b8 100644
+--- a/src/flag_gems/fused/geglu.py
++++ b/src/flag_gems/fused/geglu.py
+@@ -29,6 +29,10 @@ tanh = tl_extra_shim.tanh
+ logger = logging.getLogger(__name__)
+ 
+ 
++# wt-2026-09-10-fix (#5867): same int-exponent pow(x, 2) KeyError as ops/gelu.py —
++# CANN libdevice pow only accepts float/float dtype pairs. Pass float exponents.
++# wt <wangt635@ustc.edu.cn>
++
+ @triton.jit
+ def geglu_kernel(
+     input_ptr,
+@@ -63,7 +67,7 @@ def geglu_kernel(
+     x_a = tl.load(input_a_ptr, mask=mask, other=0.0).to(tl.float32)
+     x_b = tl.load(input_b_ptr, mask=mask, other=0.0).to(tl.float32)
+ 
+-    gelu_out = 0.5 * x_a * (1 + tanh(0.79788456 * x_a * (1 + 0.044715 * pow(x_a, 2))))
++    gelu_out = 0.5 * x_a * (1 + tanh(0.79788456 * x_a * (1 + 0.044715 * pow(x_a, 2.0))))
+     out = gelu_out * x_b
+ 
+     tl.store(output_ptr, out.to(tl.float32), mask=mask)
+@@ -119,13 +123,13 @@ def dgeglu_kernel(
+     x_a = tl.load(input_a_ptr, mask=mask, other=0.0).to(tl.float32)
+     x_b = tl.load(input_b_ptr, mask=mask, other=0.0).to(tl.float32)
+ 
+-    tanh_out = tanh(0.79788456 * x_a * (1 + 0.044715 * pow(x_a, 2)))
++    tanh_out = tanh(0.79788456 * x_a * (1 + 0.044715 * pow(x_a, 2.0)))
+     gelu_out = 0.5 * x_a * (1 + tanh_out)
+ 
+     # dgelu/dx
+-    sech2 = 1 - pow(tanh_out, 2)
++    sech2 = 1 - pow(tanh_out, 2.0)
+     dgelu = 0.5 * (1 + tanh_out) + 0.5 * x_a * sech2 * 0.79788456 * (
+-        1 + 3 * 0.044715 * pow(x_a, 2)
++        1 + 3 * 0.044715 * pow(x_a, 2.0)
+     )
+ 
+     grad_a = grad_out * x_b * dgelu
+diff --git a/src/flag_gems/fused/gelu_and_mul.py b/src/flag_gems/fused/gelu_and_mul.py
+index 9662d7f..9995237 100644
+--- a/src/flag_gems/fused/gelu_and_mul.py
++++ b/src/flag_gems/fused/gelu_and_mul.py
+@@ -27,6 +27,10 @@ logger = logging.getLogger(__name__)
+ 
+ 
+ @pointwise_dynamic(promotion_methods=[(0, 1, "DEFAULT")])
++# wt-2026-09-10-fix (#5867): same int-exponent pow(x, 2) KeyError as ops/gelu.py —
++# CANN libdevice pow only accepts float/float dtype pairs. Pass float exponents.
++# wt <wangt635@ustc.edu.cn>
++
+ @triton.jit
+ def gelu_none_and_mul_kernel(x, y):
+     x_fp32 = x.to(tl.float32)
+@@ -71,7 +75,7 @@ def gelu_tanh_and_mul_kernel(x, y):
+         * x_fp32
+         * (
+             1
+-            + tanh(x_fp32 * 0.79788456 * (1 + 0.044715 * pow(x_fp32.to(tl.float32), 2)))
++            + tanh(x_fp32 * 0.79788456 * (1 + 0.044715 * pow(x_fp32.to(tl.float32), 2.0)))
+         )
+     )
+     return x_gelu * y
+diff --git a/src/flag_gems/ops/gelu.py b/src/flag_gems/ops/gelu.py
+index 11b84b2..a36856c 100644
+--- a/src/flag_gems/ops/gelu.py
++++ b/src/flag_gems/ops/gelu.py
+@@ -1,4 +1,4 @@
+-# Copyright 2026 FlagOS Contributors
++# Copyright 2026 FlagOS Contributors.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+ # you may not use this file except in compliance with the License.
+@@ -24,10 +24,19 @@ exp = tl_extra_shim.exp
+ pow = tl_extra_shim.pow
+ tanh = tl_extra_shim.tanh
+ 
+-
+ logger = logging.getLogger(__name__)
+ 
+ 
++# wt-2026-09-10-fix (#5867): CANN's libdevice `pow` dispatch table only has
++# float/float operand pairs — {(fp32,fp32), (fp16,fp16), (bf16,bf16)} — while
++# a Python int literal (e.g. pow(x, 2)) types the exponent as int32, so the
++# (float32, int32) lookup raises KeyError and kills compilation of the whole
++# gelu tanh family on Ascend. Call sites below pass float exponents so the
++# lookup always lands on a supported pair. (Verified on CANN 8.5; issue
++# reports the same on CANN 9.0.)
++# wt <wangt635@ustc.edu.cn>
++
++
+ @pointwise_dynamic(promotion_methods=[(0, "DEFAULT")])
+ @triton.jit
+ def gelu_none(x):
+@@ -40,7 +49,9 @@ def gelu_none(x):
+ @triton.jit
+ def gelu_tanh(x):
+     x_fp32 = x.to(tl.float32)
+-    output = 0.5 * x * (1 + tanh(x_fp32 * 0.79788456 * (1 + 0.044715 * pow(x_fp32, 2))))
++    # wt-2026-09-10-fix (#5867): exponent as float, see note above
++    # wt <wangt635@ustc.edu.cn>
++    output = 0.5 * x * (1 + tanh(x_fp32 * 0.79788456 * (1 + 0.044715 * pow(x_fp32, 2.0))))
+     return output
+ 
+ 
+@@ -50,8 +61,10 @@ def gelu_backward_none(x, dy):
+     scale1: tl.constexpr = 0.7071067811  # 1 / math.sqrt(2)
+     scale2: tl.constexpr = 0.3989422803  # 1 / math.sqrt(2 * math.pi)
+     x_fp32 = x.to(tl.float32)
++    # wt-2026-09-10-fix (#5867): exponent as float, see note above
++    # wt <wangt635@ustc.edu.cn>
+     dydx = (
+-        scale2 * x_fp32 * exp(-pow(scale1 * x_fp32, 2))
++        scale2 * x_fp32 * exp(-pow(scale1 * x_fp32, 2.0))
+         + 0.5 * erf(scale1 * x_fp32)
+         + 0.5
+     )
+@@ -64,9 +77,11 @@ def gelu_backward_none(x, dy):
+ def gelu_backward_tanh(x, dy):
+     x_fp32 = x.to(tl.float32)
+     # 0.79788456 = math.sqrt(2 / math.pi)
+-    tanh_out = tanh(0.79788456 * x_fp32 * (1 + 0.044715 * pow(x_fp32, 2)))
++    # wt-2026-09-10-fix (#5867): exponents as float, see note above
++    # wt <wangt635@ustc.edu.cn>
++    tanh_out = tanh(0.79788456 * x_fp32 * (1 + 0.044715 * pow(x_fp32, 2.0)))
+     dydx = 0.5 * x_fp32 * (
+-        (1 - pow(tanh_out, 2)) * (0.79788456 + 0.1070322243 * pow(x_fp32, 2))
++        (1 - pow(tanh_out, 2.0)) * (0.79788456 + 0.1070322243 * pow(x_fp32, 2.0))
+     ) + 0.5 * (1 + tanh_out)
+     dx = dydx * dy
+     return dx
