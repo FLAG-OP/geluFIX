@@ -1,0 +1,22 @@
+/usr/local/python3.11.15/lib/python3.11/site-packages/flag_gems/utils/libentry.py:411: RuntimeWarning: active Triton backend does not provide a replay benchmarker; falling back to event timing
+  resolved_benchmark = resolve_benchmarker(
+/usr/local/python3.11.15/lib/python3.11/site-packages/torch_npu/npu/__init__.py:539: UserWarning: You can set the device capability via the environment variable TORCH_NPU_DEVICE_CAPABILITY. The return value of get_device_capability is only for compatibility with PyTorch and does not represent the actual capability of the NPU device.
+  warnings.warn(f"You can set the device capability via the environment variable TORCH_NPU_DEVICE_CAPABILITY. {warning_str}")
+/usr/local/python3.11.15/lib/python3.11/site-packages/flag_gems/utils/device_info.py:58: UserWarning: [device_info] torch_device_fn.get_device_capability returned None for device_id=0, fallback to (0, 0).
+  warnings.warn(
+/usr/local/python3.11.15/lib/python3.11/site-packages/flag_gems/config.py:171: UserWarning: resolve_user_setting: no exclude ops found; returning empty list
+  warnings.warn(
+WARNING:root:Skipped registering operator: This is not allowed since there's already a kernel registered from python overriding ne_.Scalar's behavior for PrivateUse1 dispatch key and aten namespace.
+WARNING:root:Skipped registering operator: This is not allowed since there's already a kernel registered from python overriding ne_.Tensor's behavior for PrivateUse1 dispatch key and aten namespace.
+==================================================================
+gelu 性能对照: gems(修复后) vs 原生 —— tanh 修复前=编译崩, none=回归护栏
+==================================================================
+/usr/local/python3.11.15/lib/python3.11/site-packages/flag_gems/utils/pointwise_dynamic.py:1553: UserWarning: Cannot create tensor with interal format while allow_internel_format=False, tensor will be created with base format. (Triggered internally at ../torch_npu/csrc/aten/common/TensorFactories.cpp:340.)
+  torch.empty_like(tensors[0], dtype=dtype)
+  [tanh 1MB] 原生:    11.7 us | gems修复后:   120.8 us  (10.31x)
+  [tanh 4MB] 原生:    11.2 us | gems修复后:   116.1 us  (10.36x)
+  [none 1MB] 原生:    11.3 us | gems修复后:   115.4 us  (10.21x)
+  [none 4MB] 原生:    11.3 us | gems修复后:   113.3 us  (10.01x)
+
+  [泛用补丁对照] pow(x,2) int(经提升):   32.1 us | pow(x,2.0) float:   32.1 us (差 0%, 数值 ok=False)
+  判读: int 指数经补丁提升后与 float 直接写法同性能 (constexpr 编译期归一)。
